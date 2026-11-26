@@ -101,7 +101,137 @@ Khi gửi tín hiệu `SIGTERM`, server log lần lượt `Shutting down` → `W
 
 ## Part 2: Docker
 
-*(Chưa làm — CP2)*
+### Exercise 2.1: Phân tích Dockerfile cơ bản (`02-docker/develop/Dockerfile`)
+
+1. **Base image là gì?**
+   - `python:3.11` (full Python distribution, gồm hệ điều hành Debian + Python 3.11 runtime + đầy đủ build tools, dung lượng ~1 GB).
+2. **Working directory là gì?**
+   - `/app` (`WORKDIR /app`) — thư mục làm việc mặc định bên trong container, nơi chứa mã nguồn và chạy các lệnh `COPY`, `RUN`, `CMD` phía sau.
+3. **Tại sao `COPY requirements.txt` trước rồi mới `COPY app.py`?**
+   - Để tận dụng **Docker layer cache**. Docker cache từng layer theo thứ tự lệnh; khi chỉ sửa code (`app.py`) mà không đổi `requirements.txt`, Docker tái sử dụng lại layer `pip install` đã cache thay vì tải và cài lại toàn bộ thư viện từ đầu, giúp build nhanh hơn rất nhiều.
+4. **`CMD` vs `ENTRYPOINT` khác nhau thế nào?**
+   - `CMD` định nghĩa lệnh (hoặc tham số) mặc định khi container khởi chạy và **có thể bị ghi đè dễ dàng** bằng tham số truyền thêm ở cuối lệnh `docker run <image> <cmd>`.
+   - `ENTRYPOINT` cố định chương trình chính mà container luôn chạy (chỉ ghi đè được khi dùng cờ `--entrypoint`); các tham số ở `docker run` hoặc `CMD` sẽ được truyền làm đối số cho `ENTRYPOINT`.
+
+---
+
+### Exercise 2.2: Build và chạy container `my-agent:develop`
+
+Lệnh build từ thư mục gốc repo:
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+```
+
+Kết quả gọi container `my-agent:develop` (cổng `8000`):
+
+```bash
+docker run -d --name agent-dev -p 8000:8000 my-agent:develop
+curl -i http://localhost:8000/health
+curl -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker?"
+```
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:28:37 GMT
+server: uvicorn
+content-type: application/json
+
+{"status":"ok","uptime_seconds":14.8,"container":true}
+```
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:28:47 GMT
+server: uvicorn
+content-type: application/json
+
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+---
+
+### Exercise 2.3: Multi-stage build (`02-docker/production/Dockerfile`) và so sánh kích thước image
+
+- **Stage 1 (`builder` — `FROM python:3.11-slim AS builder`):** Cài đặt các công cụ biên dịch (`gcc`, `libpq-dev`) và chạy `pip install --no-cache-dir --user -r requirements.txt` để build & cài đặt toàn bộ Python dependencies vào `/root/.local`. Image của stage này không dùng để deploy.
+- **Stage 2 (`runtime` — `FROM python:3.11-slim AS runtime`):** Bắt đầu từ base image slim sạch, tạo non-root user `appuser`, chỉ copy các package đã cài từ stage 1 (`COPY --from=builder /root/.local /home/appuser/.local`) cùng mã nguồn (`main.py`, `utils/mock_llm.py`), cấu hình `HEALTHCHECK` và chạy bằng `uvicorn` với non-root user.
+- **Tại sao image nhỏ hơn?**
+  - Dùng base image `python:3.11-slim` thay vì `python:3.11` full.
+  - Không mang theo `gcc`, `libpq-dev`, apt cache hay các file trung gian lúc biên dịch vào final image — chỉ giữ đúng runtime Python và `site-packages` cần thiết để chạy app.
+
+**So sánh kích thước thực tế đo bằng `docker images | grep my-agent`:**
+
+```text
+my-agent      advanced   808dc7b9bd85   About a minute ago   163MB
+my-agent      develop    9f12bf939c41   22 minutes ago       1.15GB
+```
+
+- **Develop (`my-agent:develop`):** `1.15 GB` (~`1150 MB`)
+- **Production (`my-agent:advanced`):** `163 MB`
+- **Chênh lệch:** giảm **`987 MB` (~`85.8%`)**
+
+---
+
+### Exercise 2.4: Docker Compose stack (`02-docker/production/docker-compose.yml`)
+
+#### Sơ đồ kiến trúc các service
+
+```text
+Client (HTTP :80 / HTTPS :443)
+        │
+        ▼
+  ┌───────────┐   proxy_pass + rate limit (10r/s) + security headers
+  │   nginx   │ ────────────────────────────────────────────────────┐
+  └───────────┘                                                     │
+                                         Docker network: internal   ▼
+                                                            ┌──────────────┐
+                                                            │    agent     │ (port 8000, không expose ra ngoài)
+                                                            └──────┬───────┘
+                                                      ┌────────────┴────────────┐
+                                                      ▼                         ▼
+                                               ┌─────────────┐          ┌──────────────┐
+                                               │    redis    │          │    qdrant    │
+                                               │ (port 6379) │          │ (port 6333)  │
+                                               └──────┬──────┘          └──────┬───────┘
+                                                      ▼                         ▼
+                                               [redis_data vol]         [qdrant_data vol]
+```
+
+**Các service và cách giao tiếp:**
+- `nginx` (`nginx:alpine`): Reverse proxy & load balancer duy nhất mở cổng ra host (`80`, `443`), gắn security headers, rate limit 10 req/s và chuyển tiếp request sang `agent:8000`.
+- `agent` (`02-docker/production/Dockerfile`, target `runtime`): Chạy FastAPI trên cổng nội bộ `8000`, chỉ khởi chạy sau khi `redis` và `qdrant` đều ở trạng thái `healthy`, kết nối qua DNS nội bộ của bridge network `internal` (`redis://redis:6379/0`, `http://qdrant:6333`).
+- `redis` (`redis:7-alpine`): Cache session & rate limiting, lưu dữ liệu bền vững vào volume `redis_data`.
+- `qdrant` (`qdrant/qdrant:v1.9.0`): Vector database cho RAG, lưu dữ liệu bền vững vào volume `qdrant_data`.
+
+#### Kết quả `docker compose ps`
+
+```text
+NAME                       IMAGE                   SERVICE   STATUS                        PORTS
+k5-day14-docker-agent-1    k5-day14-docker-agent   agent     Up About a minute (healthy)   8000/tcp
+k5-day14-docker-nginx-1    nginx:alpine            nginx     Up About a minute             0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+k5-day14-docker-qdrant-1   qdrant/qdrant:v1.9.0    qdrant    Up About a minute (healthy)   6333-6334/tcp
+k5-day14-docker-redis-1    redis:7-alpine          redis     Up About a minute (healthy)   6379/tcp
+```
+
+#### Kết quả test qua Nginx
+
+```bash
+curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question": "microservices"}'
+```
+
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Date: Thu, 26 Nov 2026 08:20:50 GMT
+Content-Type: application/json
+Content-Length: 95
+Connection: keep-alive
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
 
 ---
 
@@ -134,3 +264,4 @@ Khi gửi tín hiệu `SIGTERM`, server log lần lượt `Shutting down` → `W
 | Checkpoint | Câu hỏi / Prompt | Kết quả AI hỗ trợ | Tự kiểm tra / Chỉnh sửa |
 |---|---|---|---|
 | CP1 | Soạn mục Part 1 trong `MISSION_ANSWERS.md`. | Trình bày câu trả lời Exercise 1.1–1.3 bằng tiếng Việt. | Đối chiếu lại từng số dòng với `develop/app.py`, `production/app.py`, `production/config.py` và kiểm chứng toàn bộ HTTP response cũng như log shutdown từ kết quả chạy thực tế. |
+| CP2 | Hướng dẫn sửa lỗi build Docker và điền mục Part 2 trong `MISSION_ANSWERS.md`. | Soạn câu trả lời Dockerfile, multi-stage, sơ đồ kiến trúc và tính % chênh lệch kích thước image. | Tự build 2 image (`1.15GB` vs `163MB`), bật stack Compose và kiểm chứng response `200 OK` qua Nginx. |
