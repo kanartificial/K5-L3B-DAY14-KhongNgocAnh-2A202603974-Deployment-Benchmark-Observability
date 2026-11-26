@@ -243,7 +243,196 @@ X-XSS-Protection: 1; mode=block
 
 ## Part 4: API Security
 
-*(Chưa làm — CP3)*
+### Exercise 4.1: API Key Authentication (`04-api-gateway/develop/app.py`)
+
+**Phân tích mã nguồn:**
+- **API key được kiểm tra ở đâu?**
+  - Khai báo `API_KEY = os.getenv("AGENT_API_KEY", "demo-key-change-in-production")` và `api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)` (`develop/app.py:35-36`).
+  - Hàm dependency `verify_api_key` (`develop/app.py:39-54`) kiểm tra header `X-API-Key` và được inject vào endpoint `POST /ask` thông qua `_key: str = Depends(verify_api_key)` (`develop/app.py:70`). Các endpoint `/` và `/health` được giữ public.
+- **Điều gì xảy ra nếu thiếu hoặc sai key?**
+  - Thiếu header `X-API-Key` → trả về **`401 Unauthorized`** (`Missing API key. Include header: X-API-Key: <your-key>`).
+  - Header có giá trị nhưng không khớp `API_KEY` → trả về **`403 Forbidden`** (`Invalid API key.`).
+- **Làm sao rotate key an toàn (không downtime)?**
+  - Không thay đột ngột 1 key duy nhất mà hỗ trợ đồng thời danh sách key hợp lệ (ví dụ `AGENT_API_KEYS=old_key,new_key` từ biến môi trường / Secret Manager).
+  - Các bước: (1) Tạo key mới và thêm vào danh sách key hợp lệ trên server (deploy), (2) Cập nhật client sang dùng key mới và theo dõi log cho đến khi không còn request dùng key cũ, (3) Xóa/thu hồi (revoke) key cũ khỏi cấu hình server.
+
+**Kết quả test thực tế (`AGENT_API_KEY=secret-key-123`):**
+
+1. Không có API key → `401 Unauthorized`:
+```http
+HTTP/1.1 401 Unauthorized
+date: Thu, 26 Nov 2026 08:41:03 GMT
+server: uvicorn
+content-length: 67
+content-type: application/json
+
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+
+2. Sai API key (`X-API-Key: wrong-key`) → `403 Forbidden`:
+```http
+HTTP/1.1 403 Forbidden
+date: Thu, 26 Nov 2026 08:41:03 GMT
+server: uvicorn
+content-length: 29
+content-type: application/json
+
+{"detail":"Invalid API key."}
+```
+
+3. Có API key hợp lệ (`X-API-Key: secret-key-123`) → `200 OK`:
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:41:03 GMT
+server: uvicorn
+content-length: 145
+content-type: application/json
+
+{"question":"Hello","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+---
+
+### Exercise 4.2: JWT Authentication (`04-api-gateway/production/auth.py` & `app.py`)
+
+**JWT Flow trong `auth.py`:**
+1. Client gửi `username` và `password` tới `POST /auth/token` (`production/app.py:105-118`).
+2. `authenticate_user()` (`auth.py:70-75`) xác thực thông tin đăng nhập; sai sẽ trả về `401 Invalid credentials`.
+3. `create_token()` (`auth.py:35-43`) tạo JWT với payload gồm `sub` (username), `role` (`user`/`admin`), `iat` (thời điểm cấp), `exp` (hết hạn sau 60 phút) và ký bằng thuật toán `HS256` với `JWT_SECRET`.
+4. Client gửi token qua header `Authorization: Bearer <token>` ở các request tiếp theo tới `POST /ask`.
+5. Dependency `verify_token()` (`auth.py:46-67`) giải mã và xác minh chữ ký/hạn dùng của token (stateless, không cần query DB mỗi request):
+   - Thiếu header hoặc token hết hạn (`ExpiredSignatureError`) → `401 Unauthorized`.
+   - Token sai chữ ký hoặc bị chỉnh sửa (`InvalidTokenError`) → `403 Forbidden`.
+   - Hợp lệ → trả về `{"username": payload["sub"], "role": payload["role"]}` để áp dụng rate limit và cost guard theo từng user/role.
+
+**Kết quả test thực tế (đã che JWT token):**
+
+1. Gọi `POST /ask` không có token → `401 Unauthorized`:
+```http
+HTTP/1.1 401 Unauthorized
+date: Thu, 26 Nov 2026 08:43:20 GMT
+server: uvicorn
+www-authenticate: Bearer
+content-length: 76
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+```
+
+2. Lấy token từ `POST /auth/token` với tài khoản `student` / `demo123` → `200 OK`:
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:43:20 GMT
+server: uvicorn
+content-length: 307
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"access_token":"<REDACTED_JWT_TOKEN>","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer <REDACTED_PREFIX>..."}
+```
+
+3. Gọi `POST /ask` kèm `Authorization: Bearer <REDACTED_JWT_TOKEN>` → `200 OK`:
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:43:20 GMT
+server: uvicorn
+content-length: 184
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"Explain JWT","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","usage":{"requests_remaining":9,"budget_remaining_usd":1.6e-05}}
+```
+
+---
+
+### Exercise 4.3: Rate Limiting (`04-api-gateway/production/rate_limiter.py`)
+
+**Phân tích mã nguồn:**
+- **Algorithm được dùng:** **Sliding Window Counter** (cửa sổ trượt, `rate_limiter.py:17-71`). Mỗi `user_id` có một `deque` lưu timestamp của các request. Khi có request mới đến tại thời điểm `now`, hệ thống loại bỏ các timestamp cũ hơn `now - window_seconds` (`popleft()`). Nếu số phần tử còn lại `>= max_requests`, trả về `429 Too Many Requests` kèm các header `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`; ngược lại ghi nhận `now` vào `deque`.
+- **Giới hạn requests/minute:**
+  - User thường (`rate_limiter_user`, `rate_limiter.py:86`): **`10` requests / 60 giây**.
+  - Admin (`rate_limiter_admin`, `rate_limiter.py:87`): **`100` requests / 60 giây**.
+- **Làm sao nâng/bypass limit cho admin?**
+  - Trong `production/app.py:141`, dựa vào `role` giải mã từ JWT để chọn limiter riêng: `limiter = rate_limiter_admin if role == "admin" else rate_limiter_user`. Nếu muốn bypass hoàn toàn cho admin, có thể kiểm tra `if role != "admin": rate_limiter_user.check(username)`. Tuy nhiên, thực tế vẫn nên đặt ngưỡng cao cho admin (như 100 req/phút) thay vì vô hạn để tránh vòng lặp lỗi từ client admin làm quá tải hệ thống.
+
+**Kết quả test vòng lặp curl với tài khoản `student` (10 req/phút):**
+
+```text
+Request  1: HTTP 200 (requests_remaining: 9)
+Request  2: HTTP 200 (requests_remaining: 8)
+...
+Request  9: HTTP 200 (requests_remaining: 1)
+Request 10: HTTP 200 (requests_remaining: 0)
+Request 11: HTTP 429 -> {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+Request 12: HTTP 429 -> {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+Output đầy đủ `curl -i` khi chạm rate limit (`429 Too Many Requests`):
+```http
+HTTP/1.1 429 Too Many Requests
+date: Thu, 26 Nov 2026 08:43:21 GMT
+server: uvicorn
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795682662
+retry-after: 59
+content-length: 98
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+---
+
+### Exercise 4.4: Cost Guard (`04-api-gateway/production/cost_guard.py`)
+
+**Cách hoạt động của Cost Guard:**
+1. **Trong bản demo `production/cost_guard.py`:**
+   - Theo dõi số `input_tokens`, `output_tokens` và `request_count` theo từng user và từng ngày (`YYYY-MM-DD`), quy đổi ra chi phí USD dựa trên đơn giá model (`PRICE_PER_1K_INPUT_TOKENS`, `PRICE_PER_1K_OUTPUT_TOKENS`).
+   - Trước khi gọi LLM, `check_budget(username)` kiểm tra hai tầng:
+     - **Ngân sách toàn hệ thống** (`global_daily_budget_usd = $10/ngày`): vượt ngưỡng → log `CRITICAL` và trả `503 Service Unavailable`.
+     - **Ngân sách từng user** (`daily_budget_usd = $1/ngày`): vượt ngưỡng → trả `402 Payment Required`; chạm `80%` (`warn_at_pct = 0.8`) → ghi log `WARNING`.
+   - Sau khi LLM trả lời, `record_usage()` cộng dồn token/chi phí vào bản ghi của user và tổng chi phí hệ thống.
+
+   Kết quả kiểm tra `GET /me/usage` sau 10 request của `student`:
+   ```http
+   HTTP/1.1 200 OK
+   date: Thu, 26 Nov 2026 08:43:21 GMT
+   server: uvicorn
+   content-length: 184
+   content-type: application/json
+   x-content-type-options: nosniff
+   x-frame-options: DENY
+   x-xss-protection: 1; mode=block
+   referrer-policy: strict-origin-when-cross-origin
+
+   {"user_id":"student","date":"2026-11-26","requests":10,"input_tokens":40,"output_tokens":280,"cost_usd":0.000174,"budget_usd":1.0,"budget_remaining_usd":0.999826,"budget_used_pct":0.0}
+   ```
+
+2. **Cách triển khai Cost Guard trên production với Redis (stateless, theo bài 4.4):**
+   - Lưu chi phí trong RAM sẽ mất khi restart và không đồng bộ khi chạy nhiều instance. Trên production, dùng **Redis** với key theo chu kỳ (theo tháng `budget:{user_id}:{YYYY-MM}` hoặc theo ngày `budget:{user_id}:{YYYY-MM-DD}`):
+     - Đọc chi phí hiện tại: `current = float(r.get(key) or 0)`.
+     - Nếu `current + estimated_cost > budget_limit` (ví dụ `$10/tháng`) → trả `False` (endpoint raise `402 Payment Required`).
+     - Nếu còn ngân sách → cộng chi phí bằng `r.incrbyfloat(key, cost)` và đặt TTL tự hết hạn bằng `r.expire(key, 32 * 24 * 3600)` (32 ngày cho chu kỳ tháng, hoặc 86400s cho chu kỳ ngày) để tự reset sang kỳ mới mà không cần cron job dọn tay.
+
+3. **Tại sao phải có cả Rate Limit lẫn Cost Guard?**
+   - **Rate Limit bảo vệ tốc độ và hạ tầng:** Giới hạn số request/phút giúp chống spam, brute-force, DDoS và tránh quá tải CPU/worker/API upstream. Tuy nhiên, rate limit chỉ đếm *số lượng request*, không biết mỗi request tốn bao nhiêu token — một user gửi ít request nhưng mỗi request có prompt cực dài và output lớn vẫn có thể đốt rất nhiều tiền.
+   - **Cost Guard bảo vệ ngân sách (tiền):** Đặt trần chi tiêu cứng theo USD/token cho từng user và toàn hệ thống để tránh hóa đơn LLM tăng đột biến. Ngược lại, chỉ có cost guard mà không có rate limit thì kẻ tấn công vẫn có thể spam hàng nghìn request nhỏ/lỗi làm nghẽn server.
+   - Kết hợp cả hai (cùng Authentication) tạo thành phòng thủ nhiều lớp: **Auth (ai được gọi) → Rate Limit (gọi nhanh tới đâu) → Cost Guard (tiêu tối đa bao nhiêu tiền)**.
 
 ---
 
@@ -263,5 +452,6 @@ X-XSS-Protection: 1; mode=block
 
 | Checkpoint | Câu hỏi / Prompt | Kết quả AI hỗ trợ | Tự kiểm tra / Chỉnh sửa |
 |---|---|---|---|
-| CP1 | Soạn mục Part 1 trong `MISSION_ANSWERS.md`. | Trình bày câu trả lời Exercise 1.1–1.3 bằng tiếng Việt. | Đối chiếu lại từng số dòng với `develop/app.py`, `production/app.py`, `production/config.py` và kiểm chứng toàn bộ HTTP response cũng như log shutdown từ kết quả chạy thực tế. |
-| CP2 | Hướng dẫn sửa lỗi build Docker và điền mục Part 2 trong `MISSION_ANSWERS.md`. | Soạn câu trả lời Dockerfile, multi-stage, sơ đồ kiến trúc và tính % chênh lệch kích thước image. | Tự build 2 image (`1.15GB` vs `163MB`), bật stack Compose và kiểm chứng response `200 OK` qua Nginx. |
+| CP1 | Soạn mục CP1 trong `MISSION_ANSWERS.md`. | Trình bày câu trả lời Exercise 1.1–1.3 bằng tiếng Việt. | Đối chiếu lại từng số dòng với `develop/app.py`, `production/app.py`, `production/config.py` và kiểm chứng toàn bộ HTTP response cũng như log shutdown từ kết quả chạy thực tế. |
+| CP2 | Hướng dẫn sửa lỗi build Docker và điền mục CP2 trong `MISSION_ANSWERS.md`. | Soạn câu trả lời Dockerfile, multi-stage, sơ đồ kiến trúc và tính % chênh lệch kích thước image. | Tự build 2 image (`1.15GB` vs `163MB`), bật stack Compose và kiểm chứng response `200 OK` qua Nginx. |
+| CP3 | Soạn mục CP3 trong `MISSION_ANSWERS.md`. | Tổng hợp giải thích API Key, JWT, Rate Limiting, Cost Guard và định dạng output `curl -i`. | Tự chạy kiểm chứng đủ các mã HTTP `401`, `403`, `200`, `429` và `/me/usage`, đối chiếu số dòng code và che toàn bộ JWT token trước khi lưu. |
