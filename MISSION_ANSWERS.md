@@ -438,7 +438,195 @@ referrer-policy: strict-origin-when-cross-origin
 
 ## Part 5: Scaling & Reliability
 
-*(Chưa làm — CP4)*
+### Exercise 5.1: Health Checks — Liveness (`/health`) vs Readiness (`/ready`)
+
+**Phân tích mã nguồn (`05-scaling-reliability/develop/app.py` & `production/app.py`):**
+
+| Tiêu chí | Liveness Probe (`GET /health`) | Readiness Probe (`GET /ready`) |
+|---|---|---|
+| **Câu hỏi kiểm tra** | Process/container có còn sống không? | Instance đã sẵn sàng nhận traffic từ người dùng chưa? |
+| **Cách implement** | Trả về `200 OK` kèm `status`, `uptime_seconds`, `version`, `timestamp` và thông tin kiểm tra bộ nhớ (`develop/app.py:104-144`). Không nên trả lỗi chỉ vì dependency tạm mất kết nối nếu bản thân process vẫn khỏe. | Kiểm tra cờ `_is_ready` (`develop/app.py:147-168`) và kiểm tra kết nối Redis bằng `_redis.ping()` (`production/app.py:208-215`). Trả về `200 OK` nếu sẵn sàng, hoặc **`503 Service Unavailable`** khi đang khởi động, đang shutdown, hoặc mất kết nối Redis. |
+| **Hành động của Platform / Load Balancer** | Nếu fail liên tiếp hoặc timeout → orchestrator (K8s, Docker, Railway/Render) **restart container**. | Nếu trả `503` → load balancer (Nginx/K8s Service) **tạm ngừng route traffic mới** vào instance đó mà **không restart** container. |
+
+**Kết quả test thực tế trên `05-scaling-reliability/develop/app.py`:**
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:57:05 GMT
+server: uvicorn
+content-length: 195
+content-type: application/json
+
+{"status":"ok","uptime_seconds":1.8,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T08:57:06.350153+00:00","checks":{"memory":{"status":"ok","note":"psutil not installed"}}}
+```
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 08:57:05 GMT
+server: uvicorn
+content-length: 37
+content-type: application/json
+
+{"ready":true,"in_flight_requests":1}
+```
+
+---
+
+### Exercise 5.2: Graceful Shutdown (`05-scaling-reliability/develop/app.py`)
+
+**Cơ chế xử lý `SIGTERM` không cắt ngang request:**
+1. **Theo dõi request đang chạy:** Middleware `track_requests` (`develop/app.py:72-81`) tăng `_in_flight_requests` khi có request mới và giảm trong khối `finally` khi xử lý xong.
+2. **Bắt tín hiệu `SIGTERM` / `SIGINT`:** Đăng ký `handle_sigterm` (`develop/app.py:175-187`) và cấu hình `timeout_graceful_shutdown=30` ở `uvicorn.run()` (`develop/app.py:198`).
+3. **Lifespan shutdown (`develop/app.py:54-66`):** Khi nhận `SIGTERM` (lúc deploy hoặc scale down):
+   - Đặt `_is_ready = False` → `/ready` trả về `503` để load balancer ngừng gửi traffic mới vào instance này.
+   - Vòng lặp chờ `_in_flight_requests == 0` (tối đa 30 giây) để các request đang chạy kịp hoàn tất.
+   - Đóng tài nguyên và thoát tiến trình sạch sẽ (exit code `0`).
+
+**Kết quả test thực tế (gửi 2 request `POST /ask` song song rồi gửi `kill -SIGTERM` ngay sau 0.5s):**
+
+Cả 2 request đang chạy đều hoàn thành trọn vẹn với `200 OK`, không bị ngắt kết nối giữa chừng:
+
+```http
+# Request 1
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+
+# Request 2
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+Log phía container khi dừng `k5-day14-scaling-agent-1` bằng `docker stop` (gửi `SIGTERM`):
+```text
+agent-1  | INFO:     Shutting down
+agent-1  | INFO:     Waiting for application shutdown.
+agent-1  | INFO:app:Instance instance-bd8965 shutting down
+agent-1  | INFO:     Application shutdown complete.
+agent-1  | INFO:     Finished server process [1]
+```
+
+---
+
+### Exercise 5.3: Stateless Design (`05-scaling-reliability/production/app.py`)
+
+**Tại sao lưu state trong RAM (in-memory) bị hỏng khi chạy nhiều instance?**
+- Mỗi container/instance có vùng nhớ RAM độc lập. Khi có Load Balancer (Nginx) phân tán request theo kiểu round-robin:
+  - Request 1 của User A đi vào `Instance 1` → session/lịch sử hội thoại chỉ được lưu trong RAM của `Instance 1`.
+  - Request 2 của User A đi vào `Instance 2` → `Instance 2` không thấy session trong RAM của nó → **mất ngữ cảnh hội thoại / báo lỗi 404**.
+  - Ngoài ra, khi 1 instance crash, restart hoặc deploy mới, toàn bộ state trong RAM đều bị mất sạch.
+
+**Cách `production/app.py` refactor thành Stateless với Redis:**
+- Không lưu `conversation_history` trong biến dictionary cục bộ trên production; thay vào đó dùng **Redis dùng chung** qua biến môi trường `REDIS_URL=redis://redis:6379/0` (`production/app.py:36-41`).
+- Các hàm `save_session()` và `load_session()` (`production/app.py:59-73`) đọc/ghi lịch sử hội thoại theo key `session:{session_id}` với `_redis.setex(..., ttl_seconds=3600, ...)` (tự động hết hạn sau 1 giờ để tránh đầy bộ nhớ) và giới hạn tối đa 20 messages/session (`append_to_history`, dòng 76–90).
+- Mỗi instance sinh định danh riêng `INSTANCE_ID` (`production/app.py:52`) và trả về trong trường `served_by` của `POST /chat` để kiểm chứng bất kỳ instance nào cũng phục vụ được cùng một session.
+
+---
+
+### Exercise 5.4: Load Balancing với Nginx + 3 Agent Instances (`05-scaling-reliability/production/`)
+
+**Kiến trúc stack (`docker-compose.yml` + `nginx.conf`):**
+```text
+Client (:8080) ──▶ Nginx (round-robin + proxy_next_upstream)
+                       ├──▶ agent-1 (instance-bd8965) ──┐
+                       ├──▶ agent-2 (instance-9ff677) ──┼──▶ Redis (:6379)
+                       └──▶ agent-3 (instance-737266) ──┘
+```
+- `nginx.conf` dùng Docker DNS (`resolver 127.0.0.11 valid=10s`) trỏ tới `upstream agent_cluster { server agent:8000; }`, gắn header `X-Served-By $upstream_addr` và cấu hình failover tự động `proxy_next_upstream error timeout http_503; proxy_next_upstream_tries 3;`.
+
+**Lệnh khởi chạy và kiểm tra trạng thái stack:**
+```bash
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+docker compose -p k5-day14-scaling ps
+```
+
+```text
+NAME                       IMAGE                    COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+k5-day14-scaling-agent-1   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     37 seconds ago   Up 25 seconds (healthy)   8000/tcp
+k5-day14-scaling-agent-2   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     37 seconds ago   Up 25 seconds (healthy)   8000/tcp
+k5-day14-scaling-agent-3   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     37 seconds ago   Up 26 seconds (healthy)   8000/tcp
+k5-day14-scaling-nginx-1   nginx:alpine             "/docker-entrypoint.…"   nginx     37 seconds ago   Up 25 seconds             0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+k5-day14-scaling-redis-1   redis:7-alpine           "docker-entrypoint.s…"   redis     37 seconds ago   Up 36 seconds (healthy)   6379/tcp
+```
+
+---
+
+### Exercise 5.5: Kiểm chứng Stateless & Failover (`test_stateless.py`)
+
+**1. Kết quả chạy `python test_stateless.py` (gửi 5 câu hỏi liên tiếp trong cùng 1 `session_id` qua Nginx `:8080`):**
+
+```text
+============================================================
+Stateless Scaling Demo
+============================================================
+
+Session ID: d6a2f97b-be08-421b-8930-2995a20c9f87
+
+Request 1: [instance-bd8965]
+  Q: What is Docker?
+  A: Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!...
+
+Request 2: [instance-9ff677]
+  Q: Why do we need containers?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+Request 3: [instance-737266]
+  Q: What is Kubernetes?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+Request 4: [instance-bd8965]
+  Q: How does load balancing work?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+Request 5: [instance-9ff677]
+  Q: What is Redis used for?
+  A: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ O...
+
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-bd8965', 'instance-9ff677', 'instance-737266'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  [user]: Why do we need containers?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+  [user]: What is Kubernetes?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+  [user]: How does load balancing work?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+  [user]: What is Redis used for?...
+  [assistant]: Đây là câu trả lời từ AI agent (mock). Trong production, đây...
+
+✅ Session history preserved across all instances via Redis!
+```
+
+**2. Kiểm chứng failover khi dừng 1 instance (`docker stop k5-day14-scaling-agent-1`) và gọi tiếp với cùng `session_id`:**
+
+```http
+HTTP/1.1 200 OK
+Server: nginx/1.31.10
+Date: Thu, 26 Nov 2026 09:01:42 GMT
+Content-Type: application/json
+X-Served-By: 172.18.0.4:8000, 172.18.0.5:8000
+
+{"session_id":"d6a2f97b-be08-421b-8930-2995a20c9f87","question":"Is my session still alive after killing instance 1?","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","turn":7,"served_by":"instance-9ff677","storage":"redis"}
+```
+
+Kiểm tra `GET /chat/d6a2f97b-be08-421b-8930-2995a20c9f87/history`:
+```text
+session_id: d6a2f97b-be08-421b-8930-2995a20c9f87 count: 12
+```
+
+**Giải thích kết quả:**
+- 5 request liên tiếp được Nginx phân tán đều qua **cả 3 instance** (`instance-bd8965`, `instance-9ff677`, `instance-737266`), nhưng lịch sử hội thoại vẫn giữ nguyên đủ 10 message (5 cặp user–assistant) vì toàn bộ session lưu tập trung trên Redis.
+- Khi dừng `agent-1` (`172.18.0.4:8000`), Nginx phát hiện lỗi kết nối và tự động chuyển tiếp sang `agent-2` (`172.18.0.5:8000`, thấy rõ ở header `X-Served-By: 172.18.0.4:8000, 172.18.0.5:8000`) nhờ `proxy_next_upstream`. Request vẫn trả về `200 OK` và lịch sử hội thoại tăng lên 12 message không mất dữ liệu.
+- Sau khi kiểm thử xong đã dọn sạch stack bằng `docker compose -p k5-day14-scaling down`.
 
 ---
 
@@ -455,3 +643,4 @@ referrer-policy: strict-origin-when-cross-origin
 | CP1 | Soạn mục CP1 trong `MISSION_ANSWERS.md`. | Trình bày câu trả lời Exercise 1.1–1.3 bằng tiếng Việt. | Đối chiếu lại từng số dòng với `develop/app.py`, `production/app.py`, `production/config.py` và kiểm chứng toàn bộ HTTP response cũng như log shutdown từ kết quả chạy thực tế. |
 | CP2 | Hướng dẫn sửa lỗi build Docker và điền mục CP2 trong `MISSION_ANSWERS.md`. | Soạn câu trả lời Dockerfile, multi-stage, sơ đồ kiến trúc và tính % chênh lệch kích thước image. | Tự build 2 image (`1.15GB` vs `163MB`), bật stack Compose và kiểm chứng response `200 OK` qua Nginx. |
 | CP3 | Soạn mục CP3 trong `MISSION_ANSWERS.md`. | Tổng hợp giải thích API Key, JWT, Rate Limiting, Cost Guard và định dạng output `curl -i`. | Tự chạy kiểm chứng đủ các mã HTTP `401`, `403`, `200`, `429` và `/me/usage`, đối chiếu số dòng code và che toàn bộ JWT token trước khi lưu. |
+| CP4 | Soạn mục CP4 trong `MISSION_ANSWERS.md`  | Trình bày phân tích `/health` vs `/ready`, graceful shutdown, stateless với Redis và kết quả test load balancing/failover. | Chạy thực tế bản `develop` (`/health`, `/ready`, `SIGTERM` với 2 request song song), bật stack `k5-day14-scaling` với 3 instance `agent`, chạy `test_stateless.py`, thử `docker stop agent-1` kiểm chứng failover và dọn stack bằng `down`. |
