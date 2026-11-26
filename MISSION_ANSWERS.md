@@ -632,7 +632,33 @@ session_id: d6a2f97b-be08-421b-8930-2995a20c9f87 count: 12
 
 ## Part 6: Final Project (`check_production_ready.py`)
 
-*(Chưa làm — CP5)*
+Đã hoàn thiện toàn bộ các module trong `06-lab-complete/` (`app/config.py`, `app/auth.py`, `app/redis_client.py`, `app/rate_limiter.py`, `app/cost_guard.py`, `app/main.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) mà không chỉnh sửa `check_production_ready.py`.
+
+**Kết quả chạy `python check_production_ready.py` (đầy đủ với Docker):**
+- Kích thước Docker image (multi-stage `python:3.11-slim`, non-root `appuser`): **`160 MB`** (< 500 MB), thời gian build `19s`.
+- `docker stop` graceful shutdown: **`exit code 0` trong `0.9s`** (< 10s).
+- Stateless rate limit & cost guard lưu trên Redis; `/health` luôn trả `200` còn `/ready` trả `503` khi Redis mất kết nối.
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
 
 ---
 
@@ -644,3 +670,4 @@ session_id: d6a2f97b-be08-421b-8930-2995a20c9f87 count: 12
 | CP2 | Hướng dẫn sửa lỗi build Docker và điền mục CP2 trong `MISSION_ANSWERS.md`. | Soạn câu trả lời Dockerfile, multi-stage, sơ đồ kiến trúc và tính % chênh lệch kích thước image. | Tự build 2 image (`1.15GB` vs `163MB`), bật stack Compose và kiểm chứng response `200 OK` qua Nginx. |
 | CP3 | Soạn mục CP3 trong `MISSION_ANSWERS.md`. | Tổng hợp giải thích API Key, JWT, Rate Limiting, Cost Guard và định dạng output `curl -i`. | Tự chạy kiểm chứng đủ các mã HTTP `401`, `403`, `200`, `429` và `/me/usage`, đối chiếu số dòng code và che toàn bộ JWT token trước khi lưu. |
 | CP4 | Soạn mục CP4 trong `MISSION_ANSWERS.md`  | Trình bày phân tích `/health` vs `/ready`, graceful shutdown, stateless với Redis và kết quả test load balancing/failover. | Chạy thực tế bản `develop` (`/health`, `/ready`, `SIGTERM` với 2 request song song), bật stack `k5-day14-scaling` với 3 instance `agent`, chạy `test_stateless.py`, thử `docker stop agent-1` kiểm chứng failover và dọn stack bằng `down`. |
+| CP5 | Cập nhật mục CP5 trong `MISSION_ANSWERS.md`. | Trình bày kết quả chạy CP5 | Chạy đầy đủ `python check_production_ready.py` có Docker xác nhận `PASS 12/12` (`43/43 checks passed`, image `160 MB`, `docker stop` `0.9s`), đảm bảo không sửa `check_production_ready.py` và không commit `.env`. |
