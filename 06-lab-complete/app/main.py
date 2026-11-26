@@ -5,20 +5,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+from pathlib import Path
 import signal
 import sys
 import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.auth import verify_api_key
 from app.config import settings
 from app.cost_guard import check_budget, record_cost
+from app.llm_client import generate_answer
 from app.rate_limiter import check_rate_limit
 from app.redis_client import close_redis, redis_healthy
-from utils.mock_llm import ask as llm_ask
+
+STATIC_INDEX = Path(__file__).resolve().parent / "static" / "index.html"
 
 
 class JsonFormatter(logging.Formatter):
@@ -71,7 +74,13 @@ async def lifespan(app: FastAPI):
     _is_ready = True
     logger.info(
         "Agent startup complete",
-        extra={"extra_fields": {"event": "startup", "port": settings.port}},
+        extra={
+            "extra_fields": {
+                "event": "startup",
+                "port": settings.port,
+                "llm_mode": "live" if settings.llm_api_key else "mock",
+            }
+        },
     )
     yield
     _is_ready = False
@@ -125,6 +134,12 @@ class AskRequest(BaseModel):
     user_id: str | None = Field(default=None, max_length=128)
 
 
+@app.get("/", response_class=HTMLResponse)
+def demo_ui():
+    """Demo Web UI đơn giản để thử trực tiếp /health, /ready và /ask."""
+    return HTMLResponse(content=STATIC_INDEX.read_text(encoding="utf-8"))
+
+
 @app.get("/health")
 def health():
     """Liveness probe — luôn trả 200 khi process còn chạy (không phụ thuộc Redis)."""
@@ -132,6 +147,8 @@ def health():
         "status": "ok",
         "environment": settings.environment,
         "uptime_seconds": round(time.time() - START_TIME, 1),
+        "llm_mode": "live" if settings.llm_api_key else "mock",
+        "model": settings.llm_model if settings.llm_api_key else "mock-llm",
     }
 
 
@@ -148,18 +165,17 @@ def ask(body: AskRequest, api_key: str = Depends(verify_api_key)):
     check_rate_limit(api_key)
     check_budget()
 
-    answer = llm_ask(body.question)
-
-    input_tokens = max(1, len(body.question.split()) * 2)
-    output_tokens = max(1, len(answer.split()) * 2)
-    cost_usd = record_cost(input_tokens, output_tokens)
+    result = generate_answer(body.question)
+    cost_usd = record_cost(result["input_tokens"], result["output_tokens"])
 
     return {
         "question": body.question,
-        "answer": answer,
+        "answer": result["answer"],
+        "model": result["model"],
+        "provider": result["provider"],
         "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+            "input_tokens": result["input_tokens"],
+            "output_tokens": result["output_tokens"],
             "cost_usd": round(cost_usd, 6),
         },
     }
